@@ -14,6 +14,7 @@ import secrets
 from datetime import datetime, timezone
 from html import escape
 
+from config import APP_HOST, APP_PORT, verification_url
 from database import Session
 from models import User, EmailVerificationToken
 from email_verification import generate_verification_token
@@ -435,9 +436,7 @@ async def resend_verification(email: EmailStr = Form()):
 
         await session.commit()
 
-    verification_link = (
-        f"http://127.0.0.1:8000/verify-email?token={token}"
-    )
+    verification_link = verification_url(token)
 
     body = (
         "Здравствуйте!\n\n"
@@ -564,9 +563,7 @@ async def register(
             status_code=400,
         )
 
-    verification_link = (
-        f"http://127.0.0.1:8000/verify-email?token={token}"
-    )
+    verification_link = verification_url(token)
 
     subject = "Подтверждение электронной почты"
 
@@ -640,4 +637,4 @@ async def verify_email(token: str):
     )
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)
