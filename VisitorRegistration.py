@@ -404,9 +404,9 @@ async def resend_verification(email: EmailStr = Form()):
         "мы попробуем отправить письмо с новой ссылкой."
     )
 
-    async with Session() as session:
+    async with Session.begin() as session:
         user = await session.scalar(
-            select(User).where(User.email == str(email))
+            select(User).where(User.email == str(email)).with_for_update()
         )
 
         if user is None or user.email_verified:
@@ -419,22 +419,18 @@ async def resend_verification(email: EmailStr = Form()):
             generate_verification_token()
         )
 
-        async with session.begin_nested():
-            await session.execute(
-                delete(EmailVerificationToken).where(
-                    EmailVerificationToken.user_id == user.id
-                )
+        await session.execute(
+            delete(EmailVerificationToken).where(
+                EmailVerificationToken.user_id == user.id
             )
-
-            session.add(
-                EmailVerificationToken(
-                    user_id=user.id,
-                    token_hash=token_hash,
-                    expires_at=expires_at,
-                )
+        )
+        session.add(
+            EmailVerificationToken(
+                user_id=user.id,
+                token_hash=token_hash,
+                expires_at=expires_at,
             )
-
-        await session.commit()
+        )
 
     verification_link = verification_url(token)
 
@@ -452,8 +448,11 @@ async def resend_verification(email: EmailStr = Form()):
             "Подтверждение электронной почты",
             body,
         )
-    except Exception:
-        logger.exception("Не удалось отправить письмо подтверждения")
+    except Exception as error:
+        logger.error(
+            "Не удалось отправить письмо подтверждения (%s)",
+            type(error).__name__,
+        )
 
     return render_page(
         "Проверьте почту",
@@ -575,32 +574,65 @@ async def register(
         "Ссылка действительна 24 часа."
     )
 
-    await send_email(str(email), subject, body)
+    try:
+        await send_email(str(email), subject, body)
+    except Exception as error:
+        logger.error(
+            "Не удалось отправить письмо подтверждения (%s)",
+            type(error).__name__,
+        )
+        return render_page(
+            "Подтверждение почты",
+            '<p>Аккаунт создан, но письмо отправить не удалось. '
+            'Запросите новое письмо позже.</p>'
+            '<p><a href="/resend-verification">Отправить письмо повторно</a></p>'
+            '<p><a href="/login">Перейти ко входу</a></p>',
+            status_code=503,
+        )
 
     return RedirectResponse(url="/login", status_code=303)
 
+def invalid_verification_response():
+    return render_page(
+        "Подтверждение почты",
+        '<p>Ссылка недействительна или уже использована.</p>'
+        '<form method="get" action="/resend-verification">'
+        '<button type="submit">Отправить письмо повторно</button>'
+        '</form>',
+        status_code=400,
+    )
+
+
 @app.get("/verify-email", response_class=HTMLResponse)
 async def verify_email(token: str):
-    token_hash = hashlib.sha256(
-        token.encode("utf-8")
-    ).hexdigest()
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     async with Session.begin() as session:
+        # Find the owner without locking the token. Both confirmation and resend
+        # then lock the user first, so they cannot lock rows in opposite order.
+        user_id = await session.scalar(
+            select(EmailVerificationToken.user_id).where(
+                EmailVerificationToken.token_hash == token_hash
+            )
+        )
+        if user_id is None:
+            return invalid_verification_response()
+
+        user = await session.scalar(
+            select(User).where(User.id == user_id).with_for_update()
+        )
+        if user is None:
+            return invalid_verification_response()
+
+        # Resend may have replaced the link while this request waited for the user.
         verification = await session.scalar(
             select(EmailVerificationToken).where(
-                EmailVerificationToken.token_hash == token_hash
+                EmailVerificationToken.token_hash == token_hash,
+                EmailVerificationToken.user_id == user_id,
             ).with_for_update()
         )
-
         if verification is None:
-            return render_page(
-                "Подтверждение почты",
-                '<p>Ссылка недействительна или уже использована.</p>'
-                '<form method="get" action="/resend-verification">'
-                '<button type="submit">Отправить письмо повторно</button>'
-                '</form>',
-                status_code=400,
-            )
+            return invalid_verification_response()
 
         if verification.expires_at <= datetime.now(timezone.utc):
             await session.delete(verification)
@@ -613,17 +645,7 @@ async def verify_email(token: str):
                 status_code=400,
             )
 
-        user = await session.get(User, verification.user_id)
-
-        if user is None:
-            return render_page(
-                "Подтверждение почты",
-                "Пользователь не найден.",
-                status_code=400,
-            )
-
         user.email_verified = True
-
         await session.execute(
             delete(EmailVerificationToken).where(
                 EmailVerificationToken.user_id == user.id

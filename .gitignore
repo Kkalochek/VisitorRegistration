@@ -10,3 +10,5 @@ __pycache__/
 .DS_Store
 
 !.env.example
+!.env.test.example
+.pytest_cache/
